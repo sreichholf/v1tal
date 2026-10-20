@@ -1,0 +1,19 @@
+# build outputs
+/build/
+/dist/
+
+# downloaded/extracted artifacts (keep the README and the placeholders)
+/artifacts/toolchain/*
+!/artifacts/toolchain/.gitkeep
+/artifacts/s5/*
+!/artifacts/s5/.gitkeep
+/artifacts/firmware/*
+!/artifacts/firmware/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+
+# editor / OS noise
+.DS_Store
+*~
