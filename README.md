@@ -9,12 +9,17 @@
 
 # V1TAL
 
-**Persistent Maps for the Xiaomi/Roborock V1**
+**Persistent Maps for the Xiaomi/Roborock V1 running Valetudo**
 
 V1TAL gives a first-generation Roborock/Rockrobo V1 two things the stock firmware lacks:
 **persistent maps** and **room-segmented maps**. Everything runs on the robot. There is no
 Valetudo fork and no flashing: the stock `AppProxy` is patched in memory by an `LD_PRELOAD`
 shim, and the map + segment sidecar live on the data partition.
+
+> **Requirement: Valetudo.** V1TAL requires a V1 running Valetudo. The robot-side add-on
+> provides the map/room protocol and persistence; Valetudo is the UI and the client that
+> triggers room cleaning. The small model-definition change must be built into Valetudo as
+> described in [`BUILD.md`](BUILD.md).
 
 > **Firmware pin.** V1 firmware **004028** only. The shim is anchored to the stock `AppProxy`
 > with SHA-256 `df9b124c324842394d9f74ace99cb8eee387798922c991e755736e604376f4cc`. If your
