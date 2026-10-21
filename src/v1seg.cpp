@@ -57,7 +57,7 @@
  *
  * The file is deliberately written to compile as C or C++ (it is built with arm-linux-g++ so
  * that a throwing libroomseg (cv::Exception ROI assertion) can be caught and the run degrades
- * gracefully to geometry-only segmentation).
+ * gracefully to geometry-only segmentation; std::bad_alloc is fatal so v1appd retries).
  *
  */
 #ifndef _GNU_SOURCE
@@ -74,6 +74,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <new>
 
 #include "crc32.h"
 
@@ -85,6 +86,25 @@ static void woutf(const char *fmt, ...) {
     char buf[1024]; va_list ap; va_start(ap, fmt);
     int length = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     if (length > 0) { if (length > (int)sizeof buf) length = (int)sizeof buf; ssize_t nwritten = write(1, buf, length); (void)nwritten; }
+}
+
+/* Allocation is fatal: the producer is a short-lived child, and v1appd retries a
+ * failed run with backoff.  Checking every allocation keeps an OOM from turning
+ * into a null dereference.  _exit() skips stdio/atexit, which is unsafe on the
+ * V1's glibc 2.19 (see the logging note at the top). */
+__attribute__((malloc, alloc_size(1), returns_nonnull))
+static void *xmalloc(size_t size) {
+    if (size == 0) size = 1;
+    void *p = malloc(size);
+    if (!p) { woutf("[v1seg] allocation failed: malloc(%zu)\n", size); _exit(1); }
+    return p;
+}
+__attribute__((malloc, alloc_size(1, 2), returns_nonnull))
+static void *xcalloc(size_t count, size_t size) {
+    if (count == 0 || size == 0) { count = 1; size = 1; }
+    void *p = calloc(count, size);
+    if (!p) { woutf("[v1seg] allocation failed: calloc(%zu,%zu)\n", count, size); _exit(1); }
+    return p;
 }
 
 /* ===================================================================================== *
@@ -160,7 +180,15 @@ static int call_segment_gridmap(const char *modelpath, const unsigned char *grid
     try {
         unsigned result_code = segment_fn(&grid_arg, &vec_out_a, &vec_out_b, 1, model, &segmap_arg);
         woutf("[v1seg] segment_gridmap returned %u\n", result_code);
-        ok = 1;
+        /* libroomseg returns 0 on its validation failures and nonzero on success;
+         * a 0 return must take the same geometry-only fallback as a throw. */
+        ok = (result_code != 0);
+        if (!ok) wout("[v1seg] segment_gridmap reported failure (0); falling back to geometry-only\n");
+    } catch (const std::bad_alloc &) {
+        /* A model OOM must fail the producer so v1appd retries; the generic catch
+         * below would publish a geometry-only sidecar with exit 0 instead. */
+        wout("[v1seg] segment_gridmap out of memory (bad_alloc); exiting\n");
+        _exit(1);
     } catch (...) {
         wout("[v1seg] segment_gridmap threw (cv/model); falling back to geometry-only\n");
         ok = 0;
@@ -217,8 +245,8 @@ static const int DY4[4] = { 0, 0, 1, -1 };
 static int *dist_map;
 static void distance_transform(void) {
     size_t n = (size_t)W * H;
-    dist_map = (int *)calloc(n, sizeof(int));
-    int *queue = (int *)malloc(n * sizeof(int));
+    dist_map = (int *)xcalloc(n, sizeof(int));
+    int *queue = (int *)xmalloc(n * sizeof(int));
     long head = 0, tail = 0;
     for (int y = PAD; y < H - PAD; y++)
         for (int x = PAD; x < W - PAD; x++) {
@@ -248,9 +276,9 @@ static void find_cores(int doorRadius, int minCore) {
     size_t n = (size_t)W * H;
     if (core_label) { free(core_label); core_label = 0; }
     if (core_size) { free(core_size); core_size = 0; }
-    core_label = (int *)calloc(n, sizeof(int));
-    core_size = (int *)calloc(n + 2, sizeof(int));
-    int *bfs_queue = (int *)malloc(n * sizeof(int));
+    core_label = (int *)xcalloc(n, sizeof(int));
+    core_size = (int *)xcalloc(n + 2, sizeof(int));
+    int *bfs_queue = (int *)xmalloc(n * sizeof(int));
     core_count = 0;
     for (int y = PAD; y < H - PAD; y++)
         for (int x = PAD; x < W - PAD; x++) {
@@ -283,14 +311,14 @@ static void find_cores(int doorRadius, int minCore) {
 static int *label_map;
 static void watershed(unsigned char *barrier) {
     size_t n = (size_t)W * H;
-    label_map = (int *)calloc(n, sizeof(int));
+    label_map = (int *)xcalloc(n, sizeof(int));
     int max_dist = 0;
     for (size_t i = 0; i < n; i++) if (dist_map[i] > max_dist) max_dist = dist_map[i];
-    int *bucket_count = (int *)calloc(max_dist + 2, sizeof(int));
+    int *bucket_count = (int *)xcalloc(max_dist + 2, sizeof(int));
     for (size_t i = 0; i < n; i++)
         if (post_grid[i] == 0 && dist_map[i] > 0 && !(barrier && barrier[i])) bucket_count[dist_map[i]]++;
-    int **bucket = (int **)malloc((max_dist + 2) * sizeof(int *));
-    for (int dist = 1; dist <= max_dist; dist++) { bucket[dist] = (int *)malloc((size_t)(bucket_count[dist] + 1) * sizeof(int)); bucket_count[dist] = 0; }
+    int **bucket = (int **)xmalloc((max_dist + 2) * sizeof(int *));
+    for (int dist = 1; dist <= max_dist; dist++) { bucket[dist] = (int *)xmalloc((size_t)(bucket_count[dist] + 1) * sizeof(int)); bucket_count[dist] = 0; }
     for (size_t i = 0; i < n; i++)
         if (post_grid[i] == 0 && dist_map[i] > 0 && !(barrier && barrier[i])) {
             int dist = dist_map[i]; bucket[dist][bucket_count[dist]++] = (int)i;
@@ -333,8 +361,8 @@ static int max_wall_label;        /* highest label index present (0 if none) */
 static int build_labfield(void) {
     if (!raw_labels) return 0;
     size_t n = (size_t)W * H;
-    label_field = (int32_t *)calloc(n, sizeof(int32_t));
-    int *queue = (int *)malloc(n * sizeof(int));
+    label_field = (int32_t *)xcalloc(n, sizeof(int32_t));
+    int *queue = (int *)xmalloc(n * sizeof(int));
     long head = 0, tail = 0;
     int highest_label = 0, capped = 0;
     for (size_t i = 0; i < n; i++)
@@ -345,7 +373,7 @@ static int build_labfield(void) {
         }
     if (capped) wout("[v1seg] model labels capped at 2^20 (some ignored)\n");
     max_wall_label = highest_label;
-    wall_piece_cells = (int *)calloc((size_t)max_wall_label + 1, sizeof(int));
+    wall_piece_cells = (int *)xcalloc((size_t)max_wall_label + 1, sizeof(int));
     for (size_t i = 0; i < n; i++) {
         int32_t label_val = label_field[i];
         if (label_val > 0 && label_val <= max_wall_label) wall_piece_cells[label_val]++;
@@ -387,8 +415,12 @@ static long *region_area;
 static int *region_peak;             /* region_peak[r] = max distance-transform value inside region r */
 static void region_stats(void) {
     region_slots = core_count + 2;
-    region_area = (long *)calloc(region_slots + 1, sizeof(long));
-    region_peak = (int *)calloc(region_slots + 1, sizeof(int));
+    size_t region_bytes_long = (size_t)(region_slots + 1) * sizeof(long);
+    size_t region_bytes_int = (size_t)(region_slots + 1) * sizeof(int);
+    region_area = (long *)xmalloc(region_bytes_long);
+    memset(region_area, 0, region_bytes_long);
+    region_peak = (int *)xmalloc(region_bytes_int);
+    memset(region_peak, 0, region_bytes_int);
     for (size_t i = 0; i < (size_t)W * H; i++) {
         int region_id = label_map[i];
         if (region_id && region_id < region_slots) {
@@ -556,7 +588,7 @@ static int cmp_region_desc(const void *lhs, const void *rhs) {
  * dropped (its cells become unsegmented floor). */
 #define AUTO_ROOM_ID_MAX 15
 static void limit_auto_rooms(int *region_order, int *order_count) {
-    long *contact = (long *)calloc((size_t)region_slots + 1, sizeof(long));
+    long *contact = (long *)xcalloc((size_t)region_slots + 1, sizeof(long));
     while (*order_count > AUTO_ROOM_ID_MAX && contact) {
         int victim = region_order[*order_count - 1];      /* smallest region */
         memset(contact, 0, ((size_t)region_slots + 1) * sizeof(long));
@@ -613,12 +645,12 @@ static void limit_auto_rooms(int *region_order, int *order_count) {
 #define MAX_GRID_CELLS ((uint64_t)1 << 26)
 
 static int read_file(const char *path, unsigned char **out, size_t *len) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { woutf("[v1seg] open(%s) failed: %s\n", path, strerror(errno)); return 0; }
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) { woutf("[v1seg] bad size %s\n", path); close(fd); return 0; }
+    if (stat(path, &st) != 0 || st.st_size <= 0) { woutf("[v1seg] bad size %s\n", path); return 0; }
     size_t size = (size_t)st.st_size;
-    unsigned char *buf = (unsigned char *)malloc(size);
+    unsigned char *buf = (unsigned char *)xmalloc(size);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { woutf("[v1seg] open(%s) failed: %s\n", path, strerror(errno)); free(buf); return 0; }
     size_t received = 0;
     while (received < size) {
         ssize_t nread = read(fd, buf + received, size - received);
@@ -642,7 +674,7 @@ static int load_grid_bin(const char *path, unsigned char **seg, unsigned char **
         cells == 0 || cells > MAX_GRID_CELLS || (uint64_t)8 + cells != (uint64_t)size) {
         wout("[v1seg] bad grid.bin dims\n"); free(raw); return 0;
     }
-    unsigned char *grid = (unsigned char *)malloc((size_t)cells);
+    unsigned char *grid = (unsigned char *)xmalloc((size_t)cells);
     memcpy(grid, raw + 8, (size_t)cells);
     free(raw);
     *seg = grid; *post = grid; *pw = w; *ph = h; *scale = 20.0f; *ox = 0; *oy = 0;
@@ -662,7 +694,7 @@ static int read_bare_grid(const char *path, unsigned char **out, int *pw, int *p
         cells == 0 || cells > MAX_GRID_CELLS || (uint64_t)8 + cells != (uint64_t)size) {
         wout("[v1seg] bad model grid dims\n"); free(raw); return 0;
     }
-    unsigned char *grid = (unsigned char *)malloc((size_t)cells);
+    unsigned char *grid = (unsigned char *)xmalloc((size_t)cells);
     memcpy(grid, raw + 8, (size_t)cells);
     free(raw);
     *out = grid; *pw = w; *ph = h;
@@ -691,8 +723,8 @@ static int load_lastmap(const char *path, unsigned char **seg, unsigned char **p
     }
     int pad = PAD;
     int padded_w = (int)w + 2 * pad, padded_h = (int)h + 2 * pad;
-    unsigned char *seg_grid = (unsigned char *)calloc((size_t)padded_w * padded_h, 1);            /* border free */
-    unsigned char *post_grid_local = (unsigned char *)malloc((size_t)padded_w * padded_h);
+    unsigned char *seg_grid = (unsigned char *)xcalloc((size_t)padded_w * padded_h, 1);            /* border free */
+    unsigned char *post_grid_local = (unsigned char *)xmalloc((size_t)padded_w * padded_h);
     memset(post_grid_local, 0xFF, (size_t)padded_w * padded_h);                                          /* border obstacle */
     const unsigned char *cell_bytes = raw + 56;
     long occupied_count = 0, free_count = 0, unknown_count = 0;
@@ -744,7 +776,7 @@ static int write_segmap(const char *path, int w, int h, const unsigned char *cel
                         unsigned ts, unsigned map_id) {
     size_t cell_count = (size_t)w * h;
     size_t payload_size = cell_count + 4 + (size_t)room_count * 16;
-    unsigned char *payload_buf = (unsigned char *)malloc(payload_size);
+    unsigned char *payload_buf = (unsigned char *)xmalloc(payload_size);
     unsigned char *cursor = payload_buf;
     memcpy(cursor, cells, cell_count); cursor += cell_count;
     put_u32(cursor, (uint32_t)room_count); cursor += 4;
@@ -914,7 +946,7 @@ int main(int argc, char **argv) {
     post_grid = post_grid_buf;
 
     /* ---- (a) raw model output (from the model grid) ---- */
-    int32_t *raw_out = (int32_t *)calloc((size_t)W * H, 4);
+    int32_t *raw_out = (int32_t *)xcalloc((size_t)W * H, 4);
     int seg_ok = call_segment_gridmap(model, model_grid_buf, W, H, raw_out);
     if (model_grid_buf && model_grid_buf != post_grid_buf) free(model_grid_buf);
     if (!seg_ok) { free(raw_out); raw_out = 0; }
@@ -937,7 +969,7 @@ int main(int argc, char **argv) {
     if (cue_on) model_merge_pass();
     area_filter(minArea);
 
-    int *region_order = (int *)malloc(((size_t)core_count + 1) * sizeof(int));
+    int *region_order = (int *)xmalloc(((size_t)core_count + 1) * sizeof(int));
     int order_count = 0;
     for (int r = 1; r <= core_count; r++) if (region_area[r] > 0) region_order[order_count++] = r;
     qsort(region_order, order_count, sizeof(int), cmp_region_desc);
@@ -947,8 +979,8 @@ int main(int argc, char **argv) {
     limit_auto_rooms(region_order, &order_count);
 
     int room_count = order_count; if (room_count > AUTO_ROOM_ID_MAX) room_count = AUTO_ROOM_ID_MAX;
-    unsigned char *out_cells = (unsigned char *)calloc((size_t)W * H, 1);
-    int *remap = (int *)calloc((size_t)core_count + 1, sizeof(int));
+    unsigned char *out_cells = (unsigned char *)xcalloc((size_t)W * H, 1);
+    int *remap = (int *)xcalloc((size_t)core_count + 1, sizeof(int));
     for (int i = 0; i < room_count; i++) remap[region_order[i]] = i + 1;
     for (size_t i = 0; i < (size_t)W * H; i++) {
         int region_label = label_map[i];
@@ -957,18 +989,18 @@ int main(int argc, char **argv) {
     }
 
     /* room table: area + centroid */
-    int *room_ids = (int *)calloc(room_count + 1, sizeof(int));
-    long *room_areas = (long *)calloc(room_count + 1, sizeof(long));
-    double *sum_x = (double *)calloc(room_count + 1, sizeof(double));
-    double *sum_y = (double *)calloc(room_count + 1, sizeof(double));
+    int *room_ids = (int *)xcalloc(room_count + 1, sizeof(int));
+    long *room_areas = (long *)xcalloc(room_count + 1, sizeof(long));
+    double *sum_x = (double *)xcalloc(room_count + 1, sizeof(double));
+    double *sum_y = (double *)xcalloc(room_count + 1, sizeof(double));
     for (int i = 0; i < room_count; i++) { room_ids[i] = i + 1; room_areas[i] = region_area[region_order[i]]; }
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++) {
             unsigned char cell_id = out_cells[(size_t)y * W + x];
             if (cell_id >= 1 && cell_id <= room_count) { sum_x[cell_id - 1] += x; sum_y[cell_id - 1] += y; }
         }
-    int *room_cx = (int *)calloc(room_count + 1, sizeof(int));
-    int *room_cy = (int *)calloc(room_count + 1, sizeof(int));
+    int *room_cx = (int *)xcalloc(room_count + 1, sizeof(int));
+    int *room_cy = (int *)xcalloc(room_count + 1, sizeof(int));
     for (int i = 0; i < room_count; i++) {
         room_cx[i] = room_areas[i] ? (int)(sum_x[i] / room_areas[i]) : 0;
         room_cy[i] = room_areas[i] ? (int)(sum_y[i] / room_areas[i]) : 0;
