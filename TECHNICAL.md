@@ -47,11 +47,18 @@ both files alive, and presents a standard blob and command surface to Valetudo.
 | `init/` | upstart jobs for `v1appd` and `v1guard` |
 | `valetudo/` | the one model definition and upstream patch |
 
+The producer is short-lived; measured peak RSS on a 348x402 map is ~7.5 MB.
+It runs with `oom_score_adj=1000` (first OOM victim) and `v1appd` retries it
+with backoff.  `v1seg` checks every allocation and `_exit(1)`s with
+`[v1seg] allocation failed: ...`, so a genuine allocation failure is a clean
+producer failure, not a null dereference.
+
 ### Language choices
 
 Everything is C except `src/v1seg.cpp`. The producer calls the S5's C++ segmentation library,
 which can throw `cv::Exception`; the single C++ translation unit exists to catch that and fall
-back to geometry-only output. Keeping the shim in C avoids pulling `libstdc++` and C++
+back to geometry-only output.  A `std::bad_alloc` is fatal (`_exit(1)`) so `v1appd` retries
+instead of publishing a degraded sidecar. Keeping the shim in C avoids pulling `libstdc++` and C++
 initialisation into a process we only minimally patch.
 
 ## 2. On-robot data
