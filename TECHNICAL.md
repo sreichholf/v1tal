@@ -126,7 +126,7 @@ The shim handles these methods and passes everything else through to stock `AppP
 
 | method | behaviour |
 |---|---|
-| `app_segment_clean` | ids → per-room zones, rewritten to `app_zoned_clean`; stock cleaning path does the work. At most 5 rooms per request (the stock zone packet holds 5 zones); more, or rooms with no cells, are refused with an error |
+| `app_segment_clean` | ids → per-room zones, rewritten to `app_zoned_clean`; stock cleaning path does the work. The stock zone packet holds 5 zones. With more rooms, room rectangles are merged, cheapest first, but only where the merged rectangle covers no cell of an unselected room; if that cannot reach 5, or no requested room has cells, the request is refused with an error |
 | `get_room_mapping` | room ids and names from the sidecar / `room_names.cfg` |
 | `name_segment` | atomic rewrite of `room_names.cfg` |
 | `merge_segment` | relabel listed rooms into one user room |

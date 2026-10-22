@@ -939,33 +939,123 @@ int v1seg_seg_bbox(int id, int *out_min_col, int *out_min_row, int *out_max_col,
     return 1;
 }
 
-/* Translate requested segment ids into `app_zoned_clean` zones, in the
- * 0..51200 mm frame that AppProxyServer::HandleZonedClean expects (it then
- * subtracts 25600 internally).  Returns the number of zones. */
+/* Inclusive cell rectangle in the shared grid. */
+typedef struct { int min_col, min_row, max_col, max_row; } v1seg_cell_rect_t;
+
+/* One `app_zoned_clean` zone in the 0..51200 mm frame that
+ * AppProxyServer::HandleZonedClean expects (it then subtracts 25600 internally).
+ * The rect is an inclusive cell range [min..max].  The default emits its *outer*
+ * edge, 50*(max+1) (the live nav then reads w = x2-x1+1 as one cell past max);
+ * V1SEG_ZONE_ENDPOINT=inclusive emits 50*max, so that same inclusive nav
+ * arithmetic covers exactly the (max-min+1) cells. */
+static v1seg_zone_t zone_from_rect(const v1seg_cell_rect_t *rect, int repeat) {
+    int max_col_endpoint = g_cfg.zone_endpoint_inclusive ? rect->max_col : (rect->max_col + 1);
+    int max_row_endpoint = g_cfg.zone_endpoint_inclusive ? rect->max_row : (rect->max_row + 1);
+    v1seg_zone_t zone = {
+        MM_PER_CELL * rect->min_col, MM_PER_CELL * rect->min_row,
+        MM_PER_CELL * max_col_endpoint, MM_PER_CELL * max_row_endpoint,
+        repeat > 0 ? repeat : 1,
+    };
+    return zone;
+}
+
+/* Translate requested segment ids into one bbox zone each.  Returns the number of zones. */
 int v1seg_segments_to_zones(const long long *segs, int count, int repeat,
                             v1seg_zone_t *zones, int max_zones) {
     int zone_count = 0;
     for (int i = 0; i < count && zone_count < max_zones; i++) {
         int id = (int)segs[i];
         if (id <= 0) continue;
-        int min_col, min_row, max_col, max_row;
-        if (!v1seg_seg_bbox(id, &min_col, &min_row, &max_col, &max_row)) continue;
-        int iterations = repeat > 0 ? repeat : 1;
-        /* The bbox is an inclusive cell range [min..max].  The default emits the
-         * rect's *outer* edge, 50*(max+1) (the long-standing behaviour; the live nav
-         * then reads w = x2-x1+1 as one cell past max).  V1SEG_ZONE_ENDPOINT=inclusive
-         * emits 50*max instead, so that same inclusive nav arithmetic covers exactly
-         * the (max-min+1) bbox cells.  Default is unchanged. */
-        int max_col_endpoint = g_cfg.zone_endpoint_inclusive ? max_col : (max_col + 1);
-        int max_row_endpoint = g_cfg.zone_endpoint_inclusive ? max_row : (max_row + 1);
-        zones[zone_count].x1 = MM_PER_CELL * min_col;
-        zones[zone_count].y1 = MM_PER_CELL * min_row;
-        zones[zone_count].x2 = MM_PER_CELL * max_col_endpoint;
-        zones[zone_count].y2 = MM_PER_CELL * max_row_endpoint;
-        zones[zone_count].iterations = iterations;
-        zone_count++;
+        v1seg_cell_rect_t rect;
+        if (!v1seg_seg_bbox(id, &rect.min_col, &rect.min_row, &rect.max_col, &rect.max_row)) continue;
+        zones[zone_count++] = zone_from_rect(&rect, repeat);
     }
     return zone_count;
+}
+
+static v1seg_cell_rect_t rect_union(const v1seg_cell_rect_t *a, const v1seg_cell_rect_t *b) {
+    v1seg_cell_rect_t merged = {
+        a->min_col < b->min_col ? a->min_col : b->min_col,
+        a->min_row < b->min_row ? a->min_row : b->min_row,
+        a->max_col > b->max_col ? a->max_col : b->max_col,
+        a->max_row > b->max_row ? a->max_row : b->max_row,
+    };
+    return merged;
+}
+
+static long rect_area(const v1seg_cell_rect_t *rect) {
+    return (long)(rect->max_col - rect->min_col + 1) * (long)(rect->max_row - rect->min_row + 1);
+}
+
+/* Cells of rooms the request did not select, as a 2D prefix sum over `area`, so
+ * any candidate merged rectangle inside `area` is checked in O(1). */
+typedef struct {
+    v1seg_cell_rect_t area;
+    int stride;          /* area width + 1 */
+    uint32_t *sums;      /* (width + 1) * (height + 1) */
+} unselected_cells_t;
+
+static int unselected_cells_build(unselected_cells_t *cells, const v1seg_cell_rect_t *area,
+                                  const uint8_t selected[SEG_ID_MASK + 1]) {
+    int width = area->max_col - area->min_col + 1, height = area->max_row - area->min_row + 1;
+    cells->area = *area;
+    cells->stride = width + 1;
+    cells->sums = (uint32_t *)calloc((size_t)(width + 1) * (size_t)(height + 1), sizeof(uint32_t));
+    if (!cells->sums) return -1;
+    pthread_mutex_lock(&g_lock);
+    for (int y = 0; y < height; y++) {
+        const uint8_t *row = g_segmap ? g_segmap + (size_t)(area->min_row + y) * GRID_STRIDE + area->min_col : NULL;
+        for (int x = 0; x < width; x++) {
+            int id = row ? row[x] & SEG_ID_MASK : 0;
+            uint32_t unselected = (id && !selected[id]) ? 1u : 0u;
+            cells->sums[(size_t)(y + 1) * cells->stride + x + 1] = unselected
+                + cells->sums[(size_t)y * cells->stride + x + 1]
+                + cells->sums[(size_t)(y + 1) * cells->stride + x]
+                - cells->sums[(size_t)y * cells->stride + x];
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+static uint32_t unselected_cells_in(const unselected_cells_t *cells, const v1seg_cell_rect_t *rect) {
+    size_t x0 = (size_t)(rect->min_col - cells->area.min_col), x1 = (size_t)(rect->max_col - cells->area.min_col + 1);
+    size_t y0 = (size_t)(rect->min_row - cells->area.min_row), y1 = (size_t)(rect->max_row - cells->area.min_row + 1);
+    return cells->sums[y1 * cells->stride + x1] - cells->sums[y0 * cells->stride + x1]
+         - cells->sums[y1 * cells->stride + x0] + cells->sums[y0 * cells->stride + x0];
+}
+
+/* Merge room rectangles until at most `max_rects` remain.  A merge is allowed only
+ * when the combined rectangle holds no cell of an unselected room, so a room the
+ * user left out is never cleaned; among the allowed merges the one that adds the
+ * least extra area wins.  Order is kept (a merged rect takes the earlier slot).
+ * Returns 1 when the rects fit, 0 when no allowed merge is left. */
+static int merge_rects_to_fit(v1seg_cell_rect_t *rects, int *rect_count, int max_rects,
+                              const uint8_t selected[SEG_ID_MASK + 1]) {
+    v1seg_cell_rect_t area = rects[0];
+    for (int i = 1; i < *rect_count; i++) area = rect_union(&area, &rects[i]);
+    unselected_cells_t cells;
+    if (unselected_cells_build(&cells, &area, selected) != 0) return 0;
+    while (*rect_count > max_rects) {
+        int best_a = -1, best_b = -1;
+        long best_added = 0;
+        v1seg_cell_rect_t best_union = rects[0];
+        for (int a = 0; a < *rect_count; a++)
+            for (int b = a + 1; b < *rect_count; b++) {
+                v1seg_cell_rect_t merged = rect_union(&rects[a], &rects[b]);
+                if (unselected_cells_in(&cells, &merged)) continue;
+                long added = rect_area(&merged) - rect_area(&rects[a]) - rect_area(&rects[b]);
+                if (best_a < 0 || added < best_added) {
+                    best_a = a; best_b = b; best_added = added; best_union = merged;
+                }
+            }
+        if (best_a < 0) break;
+        rects[best_a] = best_union;
+        memmove(&rects[best_b], &rects[best_b + 1], (size_t)(*rect_count - best_b - 1) * sizeof rects[0]);
+        (*rect_count)--;
+    }
+    free(cells.sums);
+    return *rect_count <= max_rects;
 }
 
 /* ===================================================================================== *
@@ -981,12 +1071,29 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[out_len] = 0;
 }
 
-/* Zones for an app_segment_clean request.  Plans one zone past g_cfg.max_zones so
- * the caller can tell "too many rooms" (returns max_zones + 1) from a request
- * that fits; returns 0 when no requested id has cells. */
+/* Zones for an app_segment_clean request: one bbox per requested room with cells,
+ * merged (see merge_rects_to_fit) when there are more rooms than g_cfg.max_zones.
+ * Returns the zone count, 0 when no requested id has cells, or max_zones + 1 when
+ * the rooms cannot be fitted without covering an unselected room. */
 static int plan_segment_clean(const v1seg_req_t *req, v1seg_zone_t zones[V1_ZONED_CLEAN_MAX_ZONES + 1]) {
+    v1seg_cell_rect_t rects[SEG_ID_MASK];
+    uint8_t selected[SEG_ID_MASK + 1];
+    memset(selected, 0, sizeof selected);
+    int rect_count = 0;
+    for (int i = 0; i < req->nseg; i++) {
+        long long id = req->seg[i];
+        if (id <= 0 || id > SEG_ID_MASK || selected[id]) continue;
+        v1seg_cell_rect_t rect;
+        if (!v1seg_seg_bbox((int)id, &rect.min_col, &rect.min_row, &rect.max_col, &rect.max_row)) continue;
+        selected[id] = 1;
+        rects[rect_count++] = rect;
+    }
+    if (rect_count == 0) return 0;
+    if (rect_count > g_cfg.max_zones && !merge_rects_to_fit(rects, &rect_count, g_cfg.max_zones, selected))
+        return g_cfg.max_zones + 1;
     int repeat_count = req->have_repeat ? (int)req->repeat : 1;
-    return v1seg_segments_to_zones(req->seg, req->nseg, repeat_count, zones, g_cfg.max_zones + 1);
+    for (int i = 0; i < rect_count; i++) zones[i] = zone_from_rect(&rects[i], repeat_count);
+    return rect_count;
 }
 
 static char *build_zoned_clean_request(const v1seg_req_t *req, const v1seg_zone_t *zones, int zone_count) {
@@ -1006,8 +1113,8 @@ static char *build_zoned_clean_request(const v1seg_req_t *req, const v1seg_zone_
 /* V1SEG_DRYRUN_CLEAN: log exactly what the app_zoned_clean rewrite *would* have
  * sent -- one line per zone -- then let the caller answer ["ok"] without driving
  * the robot.  This is the observation tool for the first live run, not a
- * behaviour change: with the env unset nothing here runs.  The zone math is the
- * same v1seg_segments_to_zones + g_cfg.max_zones the real rewrite uses, and the map
+ * behaviour change: with the env unset nothing here runs.  The zones are the same
+ * plan_segment_clean() result the real rewrite uses, and the map
  * extents are the values the blob header carries, so the logged rects can be
  * checked against the room's rendered bbox before a wheel turns. */
 static void dryrun_log_clean(const v1seg_req_t *req, const v1seg_zone_t *zones, int zone_count) {
@@ -1037,9 +1144,6 @@ static void dryrun_log_clean(const v1seg_req_t *req, const v1seg_zone_t *zones, 
         req->id, ids, zone_count, repeat_count, map_known, map_top, map_left, map_w, map_h,
         offset_dx, offset_dy);
 
-    /* Walk the requested ids in order: the k-th id that has cells is zones[k]
-     * (v1seg_segments_to_zones keeps that order and skips ids without cells). */
-    int emitted = 0;
     for (int i = 0; i < req->nseg; i++) {
         int id = (int)req->seg[i];
         if (id <= 0) { LOG("dry-run   id=%d: ignored (id <= 0)\n", id); continue; }
@@ -1048,17 +1152,16 @@ static void dryrun_log_clean(const v1seg_req_t *req, const v1seg_zone_t *zones, 
             LOG("dry-run   id=%d: no cells in the segment grid\n", id);
             continue;
         }
-        if (emitted < zone_count && emitted < g_cfg.max_zones) {
-            const v1seg_zone_t *zone = &zones[emitted];
-            LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d] rect [%d,%d,%d,%d] it=%d\n",
-                id, min_col, max_col, min_row, max_row,
-                zone->x1, zone->y1, zone->x2, zone->y2, zone->iterations);
-        } else {
-            LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d] - over the max_zones=%d cap, "
-                "request refused\n", id, min_col, max_col, min_row, max_row, g_cfg.max_zones);
-        }
-        emitted++;
+        LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d]\n", id, min_col, max_col, min_row, max_row);
     }
+    if (zone_count > g_cfg.max_zones) {
+        LOG("dry-run   the rooms do not fit in %d zones without covering an unselected room; "
+            "request refused\n", g_cfg.max_zones);
+        return;
+    }
+    for (int i = 0; i < zone_count; i++)
+        LOG("dry-run   zone %d: rect [%d,%d,%d,%d] it=%d\n", i,
+            zones[i].x1, zones[i].y1, zones[i].x2, zones[i].y2, zones[i].iterations);
 }
 
 /* Build the `get_room_mapping` JSON reply into a fresh heap buffer sized to the
@@ -1326,9 +1429,9 @@ const char *v1seg_rcv_hook(void *server, const char *text) {
             return NULL;
         }
         if (zone_count > g_cfg.max_zones) {
-            char message[96];
-            snprintf(message, sizeof message, "too many rooms: the V1 cleans at most %d per request",
-                     g_cfg.max_zones);
+            char message[160];
+            snprintf(message, sizeof message, "the V1 cleans at most %d areas per request, and these "
+                     "rooms cannot be combined without covering unselected rooms", g_cfg.max_zones);
             reply_error_to_app(server, req.id, message);
             return NULL;
         }
