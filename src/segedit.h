@@ -57,6 +57,9 @@ enum {
     SEGEDIT_EIO      = -7    /* sidecar: I/O error                      */
 };
 
+/* User-facing text for a SEGEDIT_* code ("ok" for SEGEDIT_OK). */
+const char *segedit_strerror(int rc);
+
 /* ---- a byte-per-cell segment grid (row-major, top-first) ---- */
 typedef struct {
     int      w, h;

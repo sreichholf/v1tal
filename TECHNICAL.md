@@ -126,7 +126,7 @@ The shim handles these methods and passes everything else through to stock `AppP
 
 | method | behaviour |
 |---|---|
-| `app_segment_clean` | ids → per-room zones, rewritten to `app_zoned_clean`; stock cleaning path does the work |
+| `app_segment_clean` | ids → per-room zones, rewritten to `app_zoned_clean`; stock cleaning path does the work. At most 5 rooms per request (the stock zone packet holds 5 zones); more, or rooms with no cells, are refused with an error |
 | `get_room_mapping` | room ids and names from the sidecar / `room_names.cfg` |
 | `name_segment` | atomic rewrite of `room_names.cfg` |
 | `merge_segment` | relabel listed rooms into one user room |
@@ -138,7 +138,12 @@ The shim handles these methods and passes everything else through to stock `AppP
 | anything else | passes through to stock `AppProxy` |
 
 Zone geometry uses the 5 cm cell frame; the stock zoned-clean handler performs the final
-coordinate conversion. The command parsing, reply shaping, and zone mapping are in
+coordinate conversion.
+
+A failed command is answered with a miio error reply, `{"id":N,"error":{"code":-10000,
+"message":"..."}}`. That is the only reply shape Valetudo reports as a failure; a
+`result` of `["error"]` would be shown as success. A refused merge or split, a failed
+names write, and a failed save/reset/recover all answer this way. The command parsing, reply shaping, and zone mapping are in
 `src/addon.c`.
 
 ### Runtime knobs
@@ -151,9 +156,13 @@ timeouts, dry-run cleaning, and zone endpoint behaviour. They are defined and do
 
 The shim is an `LD_PRELOAD` object whose constructor runs before `main`. It only proceeds when:
 
-- `/proc/self/exe` is `AppProxy`, and
-- the binary SHA-256 matches the pinned 004028 build, and
-- every target instruction still contains its expected original bytes.
+- `/proc/self/exe` is `AppProxy` (any other process that inherits `LD_PRELOAD` is left
+  untouched: no log, no allocation, no file access), and
+- every target instruction still contains its expected original bytes (the full 12 bytes
+  at each gate site).
+
+The shim does not hash the binary itself. The SHA-256 pin is checked by the installer
+(`tools/install-remote.sh`) before it enables the preload line.
 
 It then patches `.text` in memory and installs four gates plus the in-place instruction edits.
 Nothing on disk is modified. If any check fails, it logs and does nothing.

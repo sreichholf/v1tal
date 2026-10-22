@@ -50,6 +50,20 @@ static void wr_u32(unsigned char *buf, uint32_t value) {
 static void wr_i32(unsigned char *buf, int32_t value) { wr_u32(buf, (uint32_t)value); }
 static void wr_f32(unsigned char *buf, float value) { uint32_t bits; memcpy(&bits, &value, 4); wr_u32(buf, bits); }
 
+const char *segedit_strerror(int rc) {
+    switch (rc) {
+    case SEGEDIT_OK:       return "ok";
+    case SEGEDIT_EARG:     return "invalid segment edit arguments";
+    case SEGEDIT_ELINE:    return "the split line has zero length";
+    case SEGEDIT_ENOSEG:   return "the segment is not in the current map";
+    case SEGEDIT_ENOID:    return "no free user segment id (16..31) left";
+    case SEGEDIT_ENOSPLIT: return "the line does not split the segment in two";
+    case SEGEDIT_EMAGIC:   return "the segment map is missing or corrupt";
+    case SEGEDIT_EIO:      return "reading or writing the segment map failed";
+    default:               return "segment edit failed";
+    }
+}
+
 /* ===================================================================================== *
  *  grid helpers                                                                         *
  * ===================================================================================== */

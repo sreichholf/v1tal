@@ -20,7 +20,8 @@
 #   -h, --help           show this help
 #
 # V1TAL_ROOT is a testing hook (empty on the robot): it prefixes /opt, /etc,
-# and /mnt paths and suppresses initctl/process checks.
+# and /mnt paths and suppresses initctl/process checks.  V1TAL_INITCTL (also
+# testing only) names an initctl to call even under V1TAL_ROOT.
 
 set -euo pipefail
 
@@ -68,8 +69,28 @@ KIT_SRC="$BUNDLE/kit"
 INIT_SRC="$BUNDLE/init"
 
 run_initctl() {
-    [ -n "$ROOT" ] && return 0
-    initctl "$@"
+    [ -n "$ROOT" ] && [ -z "${V1TAL_INITCTL:-}" ] && return 0
+    "${V1TAL_INITCTL:-initctl}" "$@"
+}
+
+# `initctl stop` takes one job (further words are KEY=VALUE), so stop each.
+stop_jobs() {
+    local job
+    for job in v1appd v1guard; do
+        run_initctl stop "$job" >/dev/null 2>&1 || true
+    done
+}
+
+# Uninstall keeps the user's map data; list it so it can be removed by hand.
+report_kept_data() {
+    local kept=() name
+    for name in persist last_segmap room_names.cfg .v1persist.lock .v1guard.lock .v1appd.lock; do
+        [ -e "$DATA/$name" ] && kept+=("$DATA/$name")
+    done
+    [ "${#kept[@]}" -gt 0 ] || return 0
+    say "kept V1TAL map data (the stock firmware does not use it):"
+    printf '    %s\n' "${kept[@]}"
+    say "to remove it: rm -rf ${kept[*]}"
 }
 
 proc_state() {
@@ -154,7 +175,7 @@ do_install() {
         return 0
     fi
 
-    run_initctl stop v1appd v1guard >/dev/null 2>&1 || true
+    stop_jobs
     mkdir -p "$DATA"
     rm -rf "$STAGE"
     mkdir -p "$STAGE"
@@ -223,12 +244,12 @@ do_uninstall() {
         say "dry-run: stop v1appd/v1guard"
         say "dry-run: remove/restore init jobs"
         say "dry-run: restore the stock ProcessList line"
-        say "dry-run: remove $KIT and $OLD"
+        say "dry-run: remove $KIT and $OLD (map data under $DATA is kept)"
         say "dry-run: no changes written"
         return 0
     fi
 
-    run_initctl stop v1appd v1guard >/dev/null 2>&1 || true
+    stop_jobs
 
     local conf dst
     for conf in v1appd.conf v1guard.conf; do
@@ -251,6 +272,7 @@ do_uninstall() {
 
     rm -rf "$KIT" "$STAGE" "$OLD"
     ok "removed runtime kit"
+    report_kept_data
 
     run_initctl reload-configuration >/dev/null 2>&1 || true
     sync

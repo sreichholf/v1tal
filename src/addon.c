@@ -151,6 +151,17 @@
 #define OFF_MIIO_GETINSTANCE 0x41bd8u
 #define OFF_MIIO_SEND        0x41e28u
 
+/* AppProxyServer::HandleZonedClean (0x333f4) packs the zones into a 64-byte
+ * payload, a u32 count plus five 12-byte zones (0x33574..0x3358a copy exactly 64
+ * bytes), and never checks the count: a 6th zone falls outside the packet and
+ * later ones overrun its stack frame. */
+#define V1_ZONED_CLEAN_MAX_ZONES 5
+
+/* `error.code` of the miio error replies the shim sends.  Valetudo's MiioSocket
+ * rejects a request only when the reply carries an `error` member; a
+ * `result:["error"]` reply resolves as success. */
+#define V1SEG_MIIO_ERROR_CODE (-10000)
+
 /* The RRMap IMAGE pixel stores the segment id in 5 bits: Valetudo's
  * RoborockMapParser.PARSE_IMAGE_BLOCK does `segmentId = (val & 0b11111000) >> 3`,
  * so the valid range is 1..31 (1..15 automatic, 16..31 user-defined; S5
@@ -190,7 +201,7 @@ typedef struct {
     char names[640];
     int  dx, dy;          /* V1SEG_BLIT_OFFSET: manual blit offset (absolute override when set) */
     int  blit_override;   /* V1SEG_BLIT_OFFSET was set explicitly -> use dx/dy verbatim */
-    int  max_zones;       /* zones per app_zoned_clean packet (V1 packet cap = 6) */
+    int  max_zones;       /* zones per app_zoned_clean packet (<= V1_ZONED_CLEAN_MAX_ZONES) */
     int  patch_deser;     /* patch Deserialize too (1) */
     int  dryrun_clean;    /* V1SEG_DRYRUN_CLEAN: log zones, reply ["ok"], never move */
     int  zone_endpoint_inclusive; /* V1SEG_ZONE_ENDPOINT=inclusive: x2 = 50*max_col (default outer edge) */
@@ -199,7 +210,7 @@ typedef struct {
 
 static v1seg_cfg_t g_cfg = {
     .root = PERSIST_DEFAULT_ROOT,
-    .dx = 0, .dy = 0, .max_zones = 5, .patch_deser = 1, .ttl_ms = 1000,
+    .dx = 0, .dy = 0, .max_zones = V1_ZONED_CLEAN_MAX_ZONES, .patch_deser = 1, .ttl_ms = 1000,
 };
 
 static void cfg_init(void) __attribute__((unused));
@@ -222,7 +233,7 @@ static void cfg_init(void) {
      * throttle never engages (re-read on every call).  Floor it at 1 s. */
     if (g_cfg.ttl_ms < 1000) g_cfg.ttl_ms = 1000;
     if (g_cfg.max_zones < 1) g_cfg.max_zones = 1;
-    if (g_cfg.max_zones > 6) g_cfg.max_zones = 6;
+    if (g_cfg.max_zones > V1_ZONED_CLEAN_MAX_ZONES) g_cfg.max_zones = V1_ZONED_CLEAN_MAX_ZONES;
     if ((env = getenv("V1SEG_VERBOSE")) && *env) g_verbose = atoi(env);
     if ((env = getenv("V1SEG_LOG")) && *env) g_log = fopen(env, "a");
 }
@@ -970,11 +981,15 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[out_len] = 0;
 }
 
-static char *build_segment_clean_request(const v1seg_req_t *req) {
-    v1seg_zone_t zones[8];
+/* Zones for an app_segment_clean request.  Plans one zone past g_cfg.max_zones so
+ * the caller can tell "too many rooms" (returns max_zones + 1) from a request
+ * that fits; returns 0 when no requested id has cells. */
+static int plan_segment_clean(const v1seg_req_t *req, v1seg_zone_t zones[V1_ZONED_CLEAN_MAX_ZONES + 1]) {
     int repeat_count = req->have_repeat ? (int)req->repeat : 1;
-    int zone_count = v1seg_segments_to_zones(req->seg, req->nseg, repeat_count, zones, g_cfg.max_zones);
-    if (zone_count <= 0) return NULL;
+    return v1seg_segments_to_zones(req->seg, req->nseg, repeat_count, zones, g_cfg.max_zones + 1);
+}
+
+static char *build_zoned_clean_request(const v1seg_req_t *req, const v1seg_zone_t *zones, int zone_count) {
     size_t capacity = 256 + (size_t)zone_count * 96;
     char *json = (char *)malloc(capacity);
     if (!json) return NULL;
@@ -995,10 +1010,8 @@ static char *build_segment_clean_request(const v1seg_req_t *req) {
  * same v1seg_segments_to_zones + g_cfg.max_zones the real rewrite uses, and the map
  * extents are the values the blob header carries, so the logged rects can be
  * checked against the room's rendered bbox before a wheel turns. */
-static void dryrun_log_clean(const v1seg_req_t *req) {
-    v1seg_zone_t zones[8];
+static void dryrun_log_clean(const v1seg_req_t *req, const v1seg_zone_t *zones, int zone_count) {
     int repeat_count = req->have_repeat ? (int)req->repeat : 1;
-    int zone_count = v1seg_segments_to_zones(req->seg, req->nseg, repeat_count, zones, g_cfg.max_zones);
 
     int map_known, map_top, map_left, map_w, map_h;
     pthread_mutex_lock(&g_lock);
@@ -1035,14 +1048,14 @@ static void dryrun_log_clean(const v1seg_req_t *req) {
             LOG("dry-run   id=%d: no cells in the segment grid\n", id);
             continue;
         }
-        if (emitted < zone_count) {
+        if (emitted < zone_count && emitted < g_cfg.max_zones) {
             const v1seg_zone_t *zone = &zones[emitted];
             LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d] rect [%d,%d,%d,%d] it=%d\n",
                 id, min_col, max_col, min_row, max_row,
                 zone->x1, zone->y1, zone->x2, zone->y2, zone->iterations);
         } else {
-            LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d] - not emitted "
-                "(max_zones=%d cap)\n", id, min_col, max_col, min_row, max_row, g_cfg.max_zones);
+            LOG("dry-run   id=%d: cells c[%d..%d] r[%d..%d] - over the max_zones=%d cap, "
+                "request refused\n", id, min_col, max_col, min_row, max_row, g_cfg.max_zones);
         }
         emitted++;
     }
@@ -1097,9 +1110,9 @@ static void *exe_call_ptr(uint32_t off) {
 /* When set, replies are delivered here instead of to AppProxy. */
 static void (*g_reply_sink)(unsigned long long id, const char *result_json) = NULL;
 
-static void reply_to_app(void *server, unsigned long long id, const char *result_json) {
-    (void)server;
-    if (g_reply_sink) { g_reply_sink(id, result_json); return; }
+/* Send `{"id":<id>,"<member>":<value_json>}` to the app; `member` is "result" or "error". */
+static void send_reply(unsigned long long id, const char *member, const char *value_json) {
+    if (g_reply_sink) { g_reply_sink(id, value_json); return; }
     if (!g_exe_base_valid) return;
     void *(*get_instance)(void) = (void *(*)(void))exe_call_ptr(OFF_MIIO_GETINSTANCE);
     void (*send_message)(void *, const char *) =
@@ -1110,13 +1123,29 @@ static void reply_to_app(void *server, unsigned long long id, const char *result
      * 8192-byte buffer, and truncating it would produce an unparsable reply.
      * send_message() consumes the text synchronously (passing a stack
      * buffer it could not retain), so freeing after the call is safe. */
-    size_t need = 64 + strlen(result_json) + 1;
+    size_t need = 64 + strlen(member) + strlen(value_json) + 1;
     char *buf = (char *)malloc(need);
     if (!buf) return;
-    snprintf(buf, need, "{\"id\":%llu,\"result\":%s}", id, result_json);
+    snprintf(buf, need, "{\"id\":%llu,\"%s\":%s}", id, member, value_json);
     VLOG("reply %s\n", buf);
     send_message(client, buf);
     free(buf);
+}
+
+static void reply_to_app(void *server, unsigned long long id, const char *result_json) {
+    (void)server;
+    send_reply(id, "result", result_json);
+}
+
+/* A miio error reply, the only shape Valetudo surfaces as a failed command. */
+static void reply_error_to_app(void *server, unsigned long long id, const char *message) {
+    (void)server;
+    char escaped[ROOM_NAME_ESCAPED_MAX * 2];
+    json_escape(message, escaped, sizeof escaped);
+    char error_json[sizeof escaped + 48];
+    snprintf(error_json, sizeof error_json, "{\"code\":%d,\"message\":\"%s\"}",
+             V1SEG_MIIO_ERROR_CODE, escaped);
+    send_reply(id, "error", error_json);
 }
 
 /* ===================================================================================== *
@@ -1166,7 +1195,7 @@ static int segedit_apply(int op, const long long *params, int param_count, int *
  * ===================================================================================== */
 /* Atomic whole-file write with the errors propagated (tmp + fsync + rename).  A
  * short write / failed fsync / failed rename is reported instead of being lost,
- * so the caller can answer `["error"]` rather than a silent `["ok"]`. */
+ * so the caller can reply with an error rather than a silent `["ok"]`. */
 static int write_file_atomic(const char *path, const char *data, size_t len) {
     char tmp[PATH_MAX];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
@@ -1188,44 +1217,55 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
 
 /* Apply `req`'s renames to the room table and rewrite room_names.cfg atomically.
  * Accepts both the upstream array form ({miRoomId,robotRoomId} entries) and the
- * legacy single {segment_id,name} form.  Returns 0 on success, <0 on error.
+ * legacy single {segment_id,name} form.
  *
- * Refuses to run when no rooms are known (g_nrooms == 0): falling through would
- * rewrite the file EMPTY and wipe every stored name.  The in-memory table is
- * only committed after the file write succeeds, so a failed write leaves the state
- * consistent with the on-disk file. */
+ * Refuses to run when no rooms are known: falling through would rewrite the file
+ * EMPTY and wipe every stored name.  The file is written from a copy of the room
+ * table with g_lock released, because the fsync can take a while on flash and the
+ * map thread needs g_lock for every raster.  The new names are committed by room
+ * id once the write succeeded, so a failed write leaves memory matching the file. */
+#define RENAME_ERR_NO_RENAMES (-1)
+#define RENAME_ERR_NO_ROOMS   (-2)
+#define RENAME_ERR_WRITE      (-3)
 static int apply_room_renames(const v1seg_req_t *req) {
-    if (req->nrenames <= 0 && !(req->have_segment_id && req->have_name)) return -1;
+    if (req->nrenames <= 0 && !(req->have_segment_id && req->have_name)) return RENAME_ERR_NO_RENAMES;
+    v1seg_room_t candidate[MAX_ROOMS];
     pthread_mutex_lock(&g_lock);
-    if (g_nrooms <= 0) { pthread_mutex_unlock(&g_lock); return -1; }
-    char candidate[MAX_ROOMS][64];
-    for (int i = 0; i < g_nrooms; i++)
-        snprintf(candidate[i], sizeof candidate[i], "%s", g_rooms[i].name);
+    int room_count = g_nrooms;
+    memcpy(candidate, g_rooms, (size_t)room_count * sizeof candidate[0]);
+    pthread_mutex_unlock(&g_lock);
+    if (room_count <= 0) return RENAME_ERR_NO_ROOMS;
+
     if (req->nrenames > 0) {
         for (int i = 0; i < req->nrenames; i++)
-            for (int j = 0; j < g_nrooms; j++)
-                if (g_rooms[j].id == req->renames[i].id) {
-                    snprintf(candidate[j], sizeof candidate[j], "%s", req->renames[i].name);
+            for (int j = 0; j < room_count; j++)
+                if (candidate[j].id == req->renames[i].id) {
+                    snprintf(candidate[j].name, sizeof candidate[j].name, "%s", req->renames[i].name);
                     break;
                 }
     } else {
-        for (int j = 0; j < g_nrooms; j++)
-            if (g_rooms[j].id == (int)req->segment_id) {
-                snprintf(candidate[j], sizeof candidate[j], "%s", req->name);
+        for (int j = 0; j < room_count; j++)
+            if (candidate[j].id == (int)req->segment_id) {
+                snprintf(candidate[j].name, sizeof candidate[j].name, "%s", req->name);
                 break;
             }
     }
     char content[MAX_ROOMS * 80];
     size_t out_len = 0;
-    for (int i = 0; i < g_nrooms && out_len < sizeof content; i++)
+    for (int i = 0; i < room_count && out_len < sizeof content; i++)
         out_len += (size_t)snprintf(content + out_len, sizeof content - out_len,
-                                    "%d=%s\n", g_rooms[i].id, candidate[i]);
-    int rc = write_file_atomic(g_cfg.names, content, out_len);
-    if (rc == 0)
-        for (int i = 0; i < g_nrooms; i++)
-            snprintf(g_rooms[i].name, sizeof g_rooms[i].name, "%s", candidate[i]);
+                                    "%d=%s\n", candidate[i].id, candidate[i].name);
+    if (write_file_atomic(g_cfg.names, content, out_len) != 0) return RENAME_ERR_WRITE;
+
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < room_count; i++)
+        for (int j = 0; j < g_nrooms; j++)
+            if (g_rooms[j].id == candidate[i].id) {
+                snprintf(g_rooms[j].name, sizeof g_rooms[j].name, "%s", candidate[i].name);
+                break;
+            }
     pthread_mutex_unlock(&g_lock);
-    return rc;
+    return 0;
 }
 
 /* ===================================================================================== *
@@ -1271,19 +1311,34 @@ const char *v1seg_rcv_hook(void *server, const char *text) {
     v1seg_refresh_sidecar(0);
 
     if (strcmp(req.method, "app_segment_clean") == 0) {
+        v1seg_zone_t zones[V1_ZONED_CLEAN_MAX_ZONES + 1];
+        int zone_count = plan_segment_clean(&req, zones);
         if (g_cfg.dryrun_clean) {
             /* Observation-only: log the zones the rewrite would have produced and
-             * answer ["ok"]; the app_zoned_clean text is never built or returned, so
-             * no motion is triggered.  See V1SEG_DRYRUN_CLEAN. */
-            dryrun_log_clean(&req);
-            LOG("app_segment_clean: dry-run -> replying [\"ok\"], rewrite suppressed\n");
+             * answer as the real path would; the app_zoned_clean text is never built
+             * or returned, so no motion is triggered.  See V1SEG_DRYRUN_CLEAN. */
+            dryrun_log_clean(&req, zones, zone_count);
+            LOG("app_segment_clean: dry-run, rewrite suppressed\n");
+        }
+        if (zone_count == 0) {
+            VLOG("app_segment_clean: no zones for ids (n=%d)\n", req.nseg);
+            reply_error_to_app(server, req.id, "none of the requested rooms has cells in the current map");
+            return NULL;
+        }
+        if (zone_count > g_cfg.max_zones) {
+            char message[96];
+            snprintf(message, sizeof message, "too many rooms: the V1 cleans at most %d per request",
+                     g_cfg.max_zones);
+            reply_error_to_app(server, req.id, message);
+            return NULL;
+        }
+        if (g_cfg.dryrun_clean) {
             reply_to_app(server, req.id, "[\"ok\"]");
             return NULL;
         }
-        char *rewritten = build_segment_clean_request(&req);
+        char *rewritten = build_zoned_clean_request(&req, zones, zone_count);
         if (!rewritten) {
-            VLOG("app_segment_clean: no zones for ids (n=%d)\n", req.nseg);
-            reply_to_app(server, req.id, "[\"ok\"]");
+            reply_error_to_app(server, req.id, "out of memory");
             return NULL;
         }
         VLOG("app_segment_clean -> app_zoned_clean: %s\n", rewritten);
@@ -1298,20 +1353,24 @@ const char *v1seg_rcv_hook(void *server, const char *text) {
     }
     if (strcmp(req.method, "get_room_mapping") == 0) {
         char *res = build_room_mapping();
-        reply_to_app(server, req.id, res ? res : "[\"error\"]");
+        if (res) reply_to_app(server, req.id, res);
+        else reply_error_to_app(server, req.id, "out of memory");
         free(res);
         return NULL;
     }
     if (strcmp(req.method, "save_map") == 0) {
         int rc = persist_map_save();
         VLOG("save_map -> %d\n", rc);
-        reply_to_app(server, req.id, rc < 0 ? "[\"error\"]" : "[\"ok\"]");
+        if (rc == PERSIST_ERR_SLAM_TS_ZERO) reply_error_to_app(server, req.id, "the map was just cleared; nothing to save");
+        else if (rc < 0) reply_error_to_app(server, req.id, "saving the map snapshot failed");
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     if (strcmp(req.method, "reset_map") == 0) {
         int rc = persist_map_reset();
         VLOG("reset_map -> %d\n", rc);
-        reply_to_app(server, req.id, rc < 0 ? "[\"error\"]" : "[\"ok\"]");
+        if (rc < 0) reply_error_to_app(server, req.id, "resetting the map failed");
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     if (strcmp(req.method, "get_recover_maps") == 0) {
@@ -1331,27 +1390,32 @@ const char *v1seg_rcv_hook(void *server, const char *text) {
         else slot = 0;
         int rc = persist_map_recover(slot);
         VLOG("recover_map %d -> %d\n", slot, rc);
-        reply_to_app(server, req.id, rc < 0 ? "[\"error\"]" : "[\"ok\"]");
+        if (rc == -2) reply_error_to_app(server, req.id, "no saved map");
+        else if (rc == -3) reply_error_to_app(server, req.id, "the saved map does not match the current map");
+        else if (rc < 0) reply_error_to_app(server, req.id, "restoring the saved map failed");
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     if (strcmp(req.method, "name_segment") == 0) {
         /* Upstream RoborockMapSegmentRenameCapability sends the whole table as
          * [{miRoomId:<name>, robotRoomId:<id>}, …]; parse_rename_array() has it in
-         * req.renames.  A write failure is reported as `["error"]`, and an empty room
+         * req.renames.  A write failure is reported as an error, and an empty room
          * list is refused instead of wiping room_names.cfg. */
         int rc = apply_room_renames(&req);
         VLOG("name_segment -> %d (%d renames)\n", rc, req.nrenames);
-        reply_to_app(server, req.id, rc == 0 ? "[\"ok\"]" : "[\"error\"]");
+        if (rc == RENAME_ERR_NO_RENAMES) reply_error_to_app(server, req.id, "no room names in the request");
+        else if (rc == RENAME_ERR_NO_ROOMS) reply_error_to_app(server, req.id, "no rooms are known yet");
+        else if (rc != 0) reply_error_to_app(server, req.id, "writing room_names.cfg failed");
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     if (strcmp(req.method, "merge_segment") == 0) {
         int target = 0;
         int rc = segedit_apply(0, req.params, req.nparams, &target);
         VLOG("merge_segment -> %d (target=%d)\n", rc, target);
-        /* always reply `["ok"]`: a semantic no-op (absent id, id range out) must not
-         * raise a UI error; the S5 tolerates these too.  rc is logged. */
         v1seg_refresh_sidecar(1);
-        reply_to_app(server, req.id, "[\"ok\"]");
+        if (rc != SEGEDIT_OK) reply_error_to_app(server, req.id, segedit_strerror(rc));
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     if (strcmp(req.method, "split_segment") == 0) {
@@ -1359,7 +1423,8 @@ const char *v1seg_rcv_hook(void *server, const char *text) {
         int rc = segedit_apply(1, req.params, req.nparams, &new_id);
         VLOG("split_segment -> %d (newid=%d)\n", rc, new_id);
         v1seg_refresh_sidecar(1);
-        reply_to_app(server, req.id, "[\"ok\"]");
+        if (rc != SEGEDIT_OK) reply_error_to_app(server, req.id, segedit_strerror(rc));
+        else reply_to_app(server, req.id, "[\"ok\"]");
         return NULL;
     }
     return text;
@@ -1655,7 +1720,6 @@ static void patch_appproxy(void) {
     VLOG("AppProxy load bias = %p\n", g_exe_base);
     uint8_t *base = (uint8_t *)g_exe_base;
 
-    if (!exe_is_appproxy()) { VLOG("executable is not AppProxy; not patching\n"); return; }
     if (!range_mapped((uintptr_t)base + OFF_RCV_SITE, 16) ||
         !range_mapped((uintptr_t)base + OFF_RCV2_SITE, 16) ||
         !range_mapped((uintptr_t)base + OFF_GEN_DATALEN, 8) ||
@@ -1751,6 +1815,9 @@ static void patch_appproxy(void) {
  * ===================================================================================== */
 #if defined(__arm__) && !defined(V1SEG_TEST_BUILD)
 __attribute__((constructor)) static void v1seg_ctor(void) {
+    /* LD_PRELOAD is inherited by every process AppProxy starts; those must not
+     * open the log, allocate the grid, create persist/ or read the sidecar. */
+    if (!exe_is_appproxy()) return;
     cfg_init();
     if (getenv("V1SEG_DISABLE")) { VLOG("disabled via V1SEG_DISABLE\n"); return; }
     VLOG("loading (AppProxy sha256 %s)\n", APP_SHA256);
@@ -1812,7 +1879,10 @@ int v1seg_test_parse_request(const char *text, v1seg_req_t *req) { return v1seg_
 int v1seg_test_build_clean(const char *request_json, char *out, size_t cap) {
     v1seg_req_t req;
     v1seg_parse_request(request_json, &req);
-    char *rewritten = build_segment_clean_request(&req);
+    v1seg_zone_t zones[V1_ZONED_CLEAN_MAX_ZONES + 1];
+    int zone_count = plan_segment_clean(&req, zones);
+    if (zone_count <= 0 || zone_count > g_cfg.max_zones) return -1;
+    char *rewritten = build_zoned_clean_request(&req, zones, zone_count);
     if (!rewritten) return -1;
     snprintf(out, cap, "%s", rewritten);
     free(rewritten);
